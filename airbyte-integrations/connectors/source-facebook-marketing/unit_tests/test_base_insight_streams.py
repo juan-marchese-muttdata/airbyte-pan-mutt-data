@@ -2,7 +2,7 @@
 # Copyright (c) 2022 Airbyte, Inc., all rights reserved.
 #
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pendulum
 import pytest
@@ -292,3 +292,111 @@ class TestBaseInsightsStream:
         assert stream.fields == ["account_id", "account_currency"]
         schema = stream.get_json_schema()
         assert schema["properties"].keys() == set(["account_currency", "account_id", stream.cursor_field])
+
+
+    def prepare_stream_and_jobs(self, insights_lookback_window, api, mocker):
+
+        # We cant use a fixed date since the internal logic of InsightAsyncJob uses today function 
+        end_date = datetime.combine(date.today(), datetime.min.time())
+        start_date = end_date - timedelta(days=insights_lookback_window*3)
+        jobs_start_date = end_date - timedelta(days=insights_lookback_window)
+
+        stream = AdsInsights(api=api, 
+                             start_date=pendulum.instance(start_date), 
+                             end_date=pendulum.instance(end_date), 
+                             insights_lookback_window=insights_lookback_window)
+
+        stream.state = {
+            AdsInsights.cursor_field: (jobs_start_date - timedelta(days=1)).isoformat(),
+            "slices": [],
+        }
+
+        job_list = []
+
+        # We need the job date in the same format that the InsightAsyncJob builds them
+        # otherwise the comparisons will faile
+        for ts_start in stream._date_intervals():
+            job = mocker.Mock(spec=InsightAsyncJob)
+            
+            job.get_result.return_value = [] # We don't need to have a value here
+            job.interval = pendulum.Period(ts_start, ts_start)
+
+            job_list.append(job)
+
+        return stream, job_list
+
+
+    # Stream needs to remove all dates from the slice after finishing,
+    # so in the next run it can re-read the recors in the attribution window
+
+    def test_read_recors_ordered(self, api, mocker):
+        """ read_records will add the job to completed slices, but when advancing the
+            cursor it will remove because is the fist one, so _completed_slices should
+            be allways empty"""
+
+        insights_lookback_window = 28
+        stream, job_list = self.prepare_stream_and_jobs(insights_lookback_window, api, mocker)
+
+        for job in job_list:
+            result = stream.read_records(sync_mode=None,#Not used
+                                         cursor_field=None,#Not used
+                                         stream_slice={"insight_job": job},
+                                         stream_state=None#Not used
+                                        )
+            result = [x for x in result] # Forsing it to be executed
+            assert len(stream._completed_slices) == 0
+
+    def test_read_recors_reverse_order(self, api, mocker):
+        """ The cursor starts from start_date, but we read jobs from the end
+            _completed_slices must have allways some value but in the last 
+            iteration it should be empty"""
+
+        insights_lookback_window = 28
+        stream, job_list = self.prepare_stream_and_jobs(insights_lookback_window, api, mocker)
+
+        job_list.reverse()
+
+        i = 0
+        for job in job_list:
+            result = stream.read_records(sync_mode=None,#Not used
+                                         cursor_field=None,#Not used
+                                         stream_slice={"insight_job": job},
+                                         stream_state=None#Not used
+                                        )
+            result = [x for x in result] # Forsing it to be executed
+            if i < insights_lookback_window:
+                assert len(stream._completed_slices) > 0
+            else:
+                assert len(stream._completed_slices) == 0
+            
+            i += 1
+
+    def test_read_recors_disordered(self, api, mocker):
+        """ _completed_slices will have something until the first date is procesed
+            the cursor will advance to the following date and again _completed_slices
+            will have something untill that date is proceced"""
+
+        insights_lookback_window = 28
+        stream, job_list = self.prepare_stream_and_jobs(insights_lookback_window, api, mocker)
+
+        # The Job list will have insights_lookback_window + 1 elements
+        job_list.reverse()
+        half = int(insights_lookback_window/2)
+        job_list = job_list[half:insights_lookback_window + 1] + \
+                   job_list[0:half]
+
+        i = 0
+        for job in job_list:
+            result = stream.read_records(sync_mode=None,#Not used
+                                         cursor_field=None,#Not used
+                                         stream_slice={"insight_job": job},
+                                         stream_state=None#Not used
+                                        )
+            result = [x for x in result] # Forsing it to be executed
+
+            if i % (half) != 0 or i == 0:
+                assert len(stream._completed_slices) > 0
+            else:
+                assert len(stream._completed_slices) == 0
+            
+            i += 1
