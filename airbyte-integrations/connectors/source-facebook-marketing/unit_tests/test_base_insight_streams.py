@@ -2,7 +2,7 @@
 # Copyright (c) 2022 Airbyte, Inc., all rights reserved.
 #
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 import pendulum
 import pytest
